@@ -1,0 +1,169 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main, for-*]
+  pull_request:
+    branches: [main, for-*]
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    name: Check commit message
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.flags.outputs.should_build }}
+      should_release: ${{ steps.flags.outputs.should_release }}
+      version: ${{ steps.flags.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse commit message
+        id: flags
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          VERSION="v$(grep -m1 '<version>' pom.xml | sed -E 's/.*<version>([^<]+)<\/version>.*/\1/')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          MSG="$COMMIT_MSG"
+          BUILD=false
+          RELEASE=false
+
+          if echo "$MSG" | grep -qi "build release"; then
+            BUILD=true
+            RELEASE=true
+          elif echo "$MSG" | grep -qi "build action"; then
+            BUILD=true
+          fi
+
+          echo "should_build=$BUILD" >> "$GITHUB_OUTPUT"
+          echo "should_release=$RELEASE" >> "$GITHUB_OUTPUT"
+          echo "Flags: build=$BUILD release=$RELEASE"
+
+  build:
+    name: Build plugin JAR
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      asset_name: ${{ steps.prepare.outputs.asset_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Build with Maven
+        run: mvn -B package
+
+      - name: Prepare artifact
+        id: prepare
+        run: |
+          VERSION="${{ needs.check.outputs.version }}"
+          JAR_FILE=$(find target -maxdepth 1 -type f -name '*.jar' ! -name 'original-*.jar' | head -1)
+          if [ -z "$JAR_FILE" ]; then
+            echo "No release jar found in target/"
+            exit 1
+          fi
+
+          ASSET_NAME="minecraft-hologram-${VERSION}.jar"
+          cp "$JAR_FILE" "$ASSET_NAME"
+          echo "asset_name=$ASSET_NAME" >> "$GITHUB_OUTPUT"
+          echo "Output: $ASSET_NAME"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.prepare.outputs.asset_name }}
+          path: ${{ steps.prepare.outputs.asset_name }}
+
+  release:
+    name: Publish Release
+    needs: [check, build]
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: List downloaded files
+        run: ls -lh
+
+      - name: Delete existing release and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.check.outputs.version }}"
+          gh release delete "$VERSION" --yes --cleanup-tag 2>/dev/null || echo "No existing release to delete"
+          sleep 3
+
+      - name: Generate release notes from template
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT_HASH: ${{ github.sha }}
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${VERSION}$" | head -1)
+
+          if [ -n "$PREV_TAG" ]; then
+            git log "${PREV_TAG}..HEAD" --pretty=format:"%s (\`%h\`) - @%an" --reverse > changelog_raw.txt
+          else
+            git log --pretty=format:"%s (\`%h\`) - @%an" --reverse > changelog_raw.txt
+          fi
+
+          if [ -s changelog_raw.txt ]; then
+            sed 's/^/- /' changelog_raw.txt > changelog_rendered.txt
+          else
+            echo '- No changelog entries.' > changelog_rendered.txt
+          fi
+
+          {
+            while IFS= read -r line || [ -n "$line" ]; do
+              if [ "$line" = "__CHANGE_LOG__" ]; then
+                cat changelog_rendered.txt
+                continue
+              fi
+
+              line="${line//__REPO__/$REPO}"
+              line="${line//__VERSION__/$VERSION}"
+              line="${line//__BRANCH__/$BRANCH}"
+              line="${line//__COMMIT_HASH__/$COMMIT_HASH}"
+              printf '%s\n' "$line"
+            done < .github/release_template.md
+          } > release_notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ needs.check.outputs.version }}"
+          JAR_FILE=$(ls minecraft-hologram-*.jar | head -1)
+          gh release create "$VERSION" \
+            --title "minecraft-hologram ${VERSION}" \
+            --notes-file release_notes.md \
+            --latest \
+            "$JAR_FILE"
